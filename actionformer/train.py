@@ -5,12 +5,6 @@ import time
 import datetime
 from pprint import pprint
 
-import itertools
-import weakref
-from typing import Any, Dict, List, Set
-import logging
-from collections import OrderedDict
-
 # torch imports
 import torch
 import torch.nn as nn
@@ -25,25 +19,6 @@ from libs.modeling import make_meta_arch
 from libs.utils import (train_one_epoch, valid_one_epoch, ANETdetection,
                         save_checkpoint, make_optimizer, make_scheduler,
                         fix_random_seed, ModelEma)
-
-
-
-from fvcore.nn.precise_bn import get_bn_modules
-
-import detectron2.utils.comm as comm
-from detectron2.utils.logger import setup_logger
-from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.config import get_cfg
-from detectron2.data import build_detection_train_loader
-from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, launch, create_ddp_model, \
-    AMPTrainer, SimpleTrainer, hooks
-from detectron2.evaluation import COCOEvaluator, LVISEvaluator, verify_results
-from detectron2.solver.build import maybe_add_gradient_clipping
-from detectron2.modeling import build_model
-
-from libs.diffusion import DiffusionDetDatasetMapper, add_diffusiondet_config, DiffusionDetWithTTA
-from libs.diffusion.util.model_ema import add_model_ema_configs, may_build_model_ema, may_get_ema_checkpointer, EMAHook, \
-    apply_model_ema_and_restore, EMADetectionCheckpointer
 
 
 ################################################################################
@@ -84,9 +59,6 @@ def main(args):
 
     """2. create dataset / dataloader"""
     '''TODO: Load annotation'''
-    mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
-    diff_data_loader = build_detection_train_loader(cfg, mapper=mapper)
-
     train_dataset = make_dataset(
         cfg['dataset_name'], True, cfg['train_split'], **cfg['dataset']
     )
@@ -100,8 +72,6 @@ def main(args):
 
     """3. create model, optimizer, and scheduler"""
     '''TODO: Add diffusion model'''
-    diff_model = build_model(cfg)
-
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
     # not ideal for multi GPU training, ok for now
@@ -144,7 +114,6 @@ def main(args):
         fid.flush()
 
     """4. training / validation loop"""
-    '''TODO: Modify training loop'''
     print("\nStart training model {:s} ...".format(cfg['model_name']))
 
     # start training

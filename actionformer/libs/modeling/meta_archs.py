@@ -10,154 +10,6 @@ from .losses import ctr_diou_loss_1d, sigmoid_focal_loss
 
 from ..utils import batched_nms
 
-class PtTransformerClsHead(nn.Module):
-    """
-    1D Conv heads for classification
-    """
-    def __init__(
-        self,
-        input_dim,
-        feat_dim,
-        num_classes,
-        prior_prob=0.01,
-        num_layers=3,
-        kernel_size=3,
-        act_layer=nn.ReLU,
-        with_ln=False,
-        empty_cls = []
-    ):
-        super().__init__()
-        self.act = act_layer()
-
-        # build the head
-        self.head = nn.ModuleList()
-        self.norm = nn.ModuleList()
-        for idx in range(num_layers-1):
-            if idx == 0:
-                in_dim = input_dim
-                out_dim = feat_dim
-            else:
-                in_dim = feat_dim
-                out_dim = feat_dim
-            self.head.append(
-                MaskedConv1D(
-                    in_dim, out_dim, kernel_size,
-                    stride=1,
-                    padding=kernel_size//2,
-                    bias=(not with_ln)
-                )
-            )
-            if with_ln:
-                self.norm.append(LayerNorm(out_dim))
-            else:
-                self.norm.append(nn.Identity())
-
-        # classifier
-        self.cls_head = MaskedConv1D(
-                feat_dim, num_classes, kernel_size,
-                stride=1, padding=kernel_size//2
-            )
-
-        # use prior in model initialization to improve stability
-        # this will overwrite other weight init
-        if prior_prob > 0:
-            bias_value = -(math.log((1 - prior_prob) / prior_prob))
-            torch.nn.init.constant_(self.cls_head.conv.bias, bias_value)
-
-        # a quick fix to empty categories:
-        # the weights assocaited with these categories will remain unchanged
-        # we set their bias to a large negative value to prevent their outputs
-        if len(empty_cls) > 0:
-            bias_value = -(math.log((1 - 1e-6) / 1e-6))
-            for idx in empty_cls:
-                torch.nn.init.constant_(self.cls_head.conv.bias[idx], bias_value)
-
-    def forward(self, fpn_feats, fpn_masks):
-        assert len(fpn_feats) == len(fpn_masks)
-
-        # apply the classifier for each pyramid level
-        out_logits = tuple()
-        for _, (cur_feat, cur_mask) in enumerate(zip(fpn_feats, fpn_masks)):
-            cur_out = cur_feat
-            for idx in range(len(self.head)):
-                cur_out, _ = self.head[idx](cur_out, cur_mask)
-                cur_out = self.act(self.norm[idx](cur_out))
-            cur_logits, _ = self.cls_head(cur_out, cur_mask)
-            out_logits += (cur_logits, )
-
-        # fpn_masks remains the same
-        return out_logits
-
-
-class PtTransformerRegHead(nn.Module):
-    """
-    Shared 1D Conv heads for regression
-    Simlar logic as PtTransformerClsHead with separated implementation for clarity
-    """
-    def __init__(
-        self,
-        input_dim,
-        feat_dim,
-        fpn_levels,
-        num_layers=3,
-        kernel_size=3,
-        act_layer=nn.ReLU,
-        with_ln=False
-    ):
-        super().__init__()
-        self.fpn_levels = fpn_levels
-        self.act = act_layer()
-
-        # build the conv head
-        self.head = nn.ModuleList()
-        self.norm = nn.ModuleList()
-        for idx in range(num_layers-1):
-            if idx == 0:
-                in_dim = input_dim
-                out_dim = feat_dim
-            else:
-                in_dim = feat_dim
-                out_dim = feat_dim
-            self.head.append(
-                MaskedConv1D(
-                    in_dim, out_dim, kernel_size,
-                    stride=1,
-                    padding=kernel_size//2,
-                    bias=(not with_ln)
-                )
-            )
-            if with_ln:
-                self.norm.append(LayerNorm(out_dim))
-            else:
-                self.norm.append(nn.Identity())
-
-        self.scale = nn.ModuleList()
-        for idx in range(fpn_levels):
-            self.scale.append(Scale())
-
-        # segment regression
-        self.offset_head = MaskedConv1D(
-                feat_dim, 2, kernel_size,
-                stride=1, padding=kernel_size//2
-            )
-
-    def forward(self, fpn_feats, fpn_masks):
-        assert len(fpn_feats) == len(fpn_masks)
-        assert len(fpn_feats) == self.fpn_levels
-
-        # apply the classifier for each pyramid level
-        out_offsets = tuple()
-        for l, (cur_feat, cur_mask) in enumerate(zip(fpn_feats, fpn_masks)):
-            cur_out = cur_feat
-            for idx in range(len(self.head)):
-                cur_out, _ = self.head[idx](cur_out, cur_mask)
-                cur_out = self.act(self.norm[idx](cur_out))
-            cur_offsets, _ = self.offset_head(cur_out, cur_mask)
-            out_offsets += (F.relu(self.scale[l](cur_offsets)), )
-
-        # fpn_masks remains the same
-        return out_offsets
-
 
 @register_meta_arch("LocPointTransformer")
 class PtTransformer(nn.Module):
@@ -181,11 +33,7 @@ class PtTransformer(nn.Module):
         fpn_dim,               # feature dim on FPN
         fpn_with_ln,           # if to apply layer norm at the end of fpn
         fpn_start_level,       # start level of fpn
-        head_dim,              # feature dim for head
         regression_range,      # regression range on each level of FPN
-        head_num_layers,       # number of layers in the head (including the classifier)
-        head_kernel_size,      # kernel size for reg/cls heads
-        head_with_ln,          # attache layernorm to reg/cls heads
         use_abs_pe,            # if to use abs position encoding
         use_rel_pe,            # if to use rel position encoding
         num_classes,           # number of action classes
@@ -293,32 +141,6 @@ class PtTransformer(nn.Module):
             }
         )
 
-        # location generator: points
-        self.point_generator = make_generator(
-            'point',
-            **{
-                'max_seq_len' : max_seq_len * max_buffer_len_factor,
-                'fpn_strides' : self.fpn_strides,
-                'regression_range' : self.reg_range
-            }
-        )
-
-        # classfication and regerssion heads
-        self.cls_head = PtTransformerClsHead(
-            fpn_dim, head_dim, self.num_classes,
-            kernel_size=head_kernel_size,
-            prior_prob=self.train_cls_prior_prob,
-            with_ln=head_with_ln,
-            num_layers=head_num_layers,
-            empty_cls=train_cfg['head_empty_cls']
-        )
-        self.reg_head = PtTransformerRegHead(
-            fpn_dim, head_dim, len(self.fpn_strides),
-            kernel_size=head_kernel_size,
-            num_layers=head_num_layers,
-            with_ln=head_with_ln
-        )
-
         # maintain an EMA of #foreground to stabilize the loss normalizer
         # useful for small mini-batch training
         self.loss_normalizer = train_cfg['init_loss_norm']
@@ -338,53 +160,55 @@ class PtTransformer(nn.Module):
         feats, masks = self.backbone(batched_inputs, batched_masks)
         fpn_feats, fpn_masks = self.neck(feats, masks)
 
-        # compute the point coordinate along the FPN
-        # this is used for computing the GT or decode the final results
-        # points: List[T x 4] with length = # fpn levels
-        # (shared across all samples in the mini-batch)
-        points = self.point_generator(fpn_feats)
+        return fpn_feats
 
-        # out_cls: List[B, #cls + 1, T_i]
-        out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
-        # out_offset: List[B, 2, T_i]
-        out_offsets = self.reg_head(fpn_feats, fpn_masks)
+        # # compute the point coordinate along the FPN
+        # # this is used for computing the GT or decode the final results
+        # # points: List[T x 4] with length = # fpn levels
+        # # (shared across all samples in the mini-batch)
+        # points = self.point_generator(fpn_feats)
 
-        # permute the outputs
-        # out_cls: F List[B, #cls, T_i] -> F List[B, T_i, #cls]
-        out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
-        # out_offset: F List[B, 2 (xC), T_i] -> F List[B, T_i, 2 (xC)]
-        out_offsets = [x.permute(0, 2, 1) for x in out_offsets]
-        # fpn_masks: F list[B, 1, T_i] -> F List[B, T_i]
-        fpn_masks = [x.squeeze(1) for x in fpn_masks]
+        # # out_cls: List[B, #cls + 1, T_i]
+        # out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
+        # # out_offset: List[B, 2, T_i]
+        # out_offsets = self.reg_head(fpn_feats, fpn_masks)
 
-        # return loss during training
-        if self.training:
-            # generate segment/lable List[N x 2] / List[N] with length = B
-            assert video_list[0]['segments'] is not None, "GT action labels does not exist"
-            assert video_list[0]['labels'] is not None, "GT action labels does not exist"
-            gt_segments = [x['segments'].to(self.device) for x in video_list]
-            gt_labels = [x['labels'].to(self.device) for x in video_list]
+        # # permute the outputs
+        # # out_cls: F List[B, #cls, T_i] -> F List[B, T_i, #cls]
+        # out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
+        # # out_offset: F List[B, 2 (xC), T_i] -> F List[B, T_i, 2 (xC)]
+        # out_offsets = [x.permute(0, 2, 1) for x in out_offsets]
+        # # fpn_masks: F list[B, 1, T_i] -> F List[B, T_i]
+        # fpn_masks = [x.squeeze(1) for x in fpn_masks]
 
-            # compute the gt labels for cls & reg
-            # list of prediction targets
-            gt_cls_labels, gt_offsets = self.label_points(
-                points, gt_segments, gt_labels)
+        # # return loss during training
+        # if self.training:
+        #     # generate segment/lable List[N x 2] / List[N] with length = B
+        #     assert video_list[0]['segments'] is not None, "GT action labels does not exist"
+        #     assert video_list[0]['labels'] is not None, "GT action labels does not exist"
+        #     gt_segments = [x['segments'].to(self.device) for x in video_list]
+        #     gt_labels = [x['labels'].to(self.device) for x in video_list]
 
-            # compute the loss and return
-            losses = self.losses(
-                fpn_masks,
-                out_cls_logits, out_offsets,
-                gt_cls_labels, gt_offsets
-            )
-            return losses
+        #     # compute the gt labels for cls & reg
+        #     # list of prediction targets
+        #     gt_cls_labels, gt_offsets = self.label_points(
+        #         points, gt_segments, gt_labels)
 
-        else:
-            # decode the actions (sigmoid / stride, etc)
-            results = self.inference(
-                video_list, points, fpn_masks,
-                out_cls_logits, out_offsets
-            )
-            return results
+        #     # compute the loss and return
+        #     losses = self.losses(
+        #         fpn_masks,
+        #         out_cls_logits, out_offsets,
+        #         gt_cls_labels, gt_offsets
+        #     )
+        #     return losses
+
+        # else:
+        #     # decode the actions (sigmoid / stride, etc)
+        #     results = self.inference(
+        #         video_list, points, fpn_masks,
+        #         out_cls_logits, out_offsets
+        #     )
+        #     return results
 
     @torch.no_grad()
     def preprocessing(self, video_list, padding_val=0.0):
