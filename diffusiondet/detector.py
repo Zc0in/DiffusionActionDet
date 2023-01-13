@@ -65,7 +65,7 @@ class DiffusionDet(nn.Module):
     Implement DiffusionDet
     """
 
-    def __init__(self, cfg, encoder):
+    def __init__(self, cfg):
         super().__init__()
 
         self.device = torch.device(cfg.MODEL.DEVICE)
@@ -77,11 +77,8 @@ class DiffusionDet(nn.Module):
         self.num_heads = cfg.MODEL.DiffusionDet.NUM_HEADS
 
         # Build Backbone.
-        # self.backbone = build_backbone(cfg)
-        # self.size_divisibility = self.backbone.size_divisibility
-
-        # Build encoder
-        self.encoder = encoder() 
+        self.backbone = build_backbone(cfg)
+        self.size_divisibility = self.backbone.size_divisibility
 
         # build diffusion
         timesteps = 1000
@@ -306,7 +303,7 @@ class DiffusionDet(nn.Module):
             images = nested_tensor_from_tensor_list(images)
 
         # Feature Extraction.
-        src = self.encoder.forward(images.tensor)
+        src = self.backbone(images.tensor)
         features = list()
         for f in self.in_features:
             feature = src[f]

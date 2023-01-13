@@ -3,12 +3,170 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torch.utils.checkpoint as checkpoint
+import numpy as np
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-from .models import register_meta_arch, make_backbone, make_neck, make_generator
-from .blocks import MaskedConv1D, Scale, LayerNorm
-from .losses import ctr_diou_loss_1d, sigmoid_focal_loss
+import fvcore.nn.weight_init as weight_init
 
-from ..utils import batched_nms
+from detectron2.layers import ShapeSpec
+from detectron2.modeling.backbone.backbone import Backbone
+from detectron2.modeling.backbone.build import BACKBONE_REGISTRY
+from detectron2.modeling.backbone.fpn import FPN, LastLevelMaxPool
+
+from ..actionformer.libs.modeling.models import register_meta_arch, make_backbone, make_neck, make_generator
+from ..actionformer.libs.modeling.blocks import MaskedConv1D, Scale, LayerNorm
+from ..actionformer.libs.modeling.losses import ctr_diou_loss_1d, sigmoid_focal_loss
+
+from ..actionformer.libs.utils import batched_nms
+
+# class PtTransformerClsHead(nn.Module):
+#     """
+#     1D Conv heads for classification
+#     """
+#     def __init__(
+#         self,
+#         input_dim,
+#         feat_dim,
+#         num_classes,
+#         prior_prob=0.01,
+#         num_layers=3,
+#         kernel_size=3,
+#         act_layer=nn.ReLU,
+#         with_ln=False,
+#         empty_cls = []
+#     ):
+#         super().__init__()
+#         self.act = act_layer()
+
+#         # build the head
+#         self.head = nn.ModuleList()
+#         self.norm = nn.ModuleList()
+#         for idx in range(num_layers-1):
+#             if idx == 0:
+#                 in_dim = input_dim
+#                 out_dim = feat_dim
+#             else:
+#                 in_dim = feat_dim
+#                 out_dim = feat_dim
+#             self.head.append(
+#                 MaskedConv1D(
+#                     in_dim, out_dim, kernel_size,
+#                     stride=1,
+#                     padding=kernel_size//2,
+#                     bias=(not with_ln)
+#                 )
+#             )
+#             if with_ln:
+#                 self.norm.append(LayerNorm(out_dim))
+#             else:
+#                 self.norm.append(nn.Identity())
+
+#         # classifier
+#         self.cls_head = MaskedConv1D(
+#                 feat_dim, num_classes, kernel_size,
+#                 stride=1, padding=kernel_size//2
+#             )
+
+#         # use prior in model initialization to improve stability
+#         # this will overwrite other weight init
+#         if prior_prob > 0:
+#             bias_value = -(math.log((1 - prior_prob) / prior_prob))
+#             torch.nn.init.constant_(self.cls_head.conv.bias, bias_value)
+
+#         # a quick fix to empty categories:
+#         # the weights assocaited with these categories will remain unchanged
+#         # we set their bias to a large negative value to prevent their outputs
+#         if len(empty_cls) > 0:
+#             bias_value = -(math.log((1 - 1e-6) / 1e-6))
+#             for idx in empty_cls:
+#                 torch.nn.init.constant_(self.cls_head.conv.bias[idx], bias_value)
+
+#     def forward(self, fpn_feats, fpn_masks):
+#         assert len(fpn_feats) == len(fpn_masks)
+
+#         # apply the classifier for each pyramid level
+#         out_logits = tuple()
+#         for _, (cur_feat, cur_mask) in enumerate(zip(fpn_feats, fpn_masks)):
+#             cur_out = cur_feat
+#             for idx in range(len(self.head)):
+#                 cur_out, _ = self.head[idx](cur_out, cur_mask)
+#                 cur_out = self.act(self.norm[idx](cur_out))
+#             cur_logits, _ = self.cls_head(cur_out, cur_mask)
+#             out_logits += (cur_logits, )
+
+#         # fpn_masks remains the same
+#         return out_logits
+
+
+# class PtTransformerRegHead(nn.Module):
+#     """
+#     Shared 1D Conv heads for regression
+#     Simlar logic as PtTransformerClsHead with separated implementation for clarity
+#     """
+#     def __init__(
+#         self,
+#         input_dim,
+#         feat_dim,
+#         fpn_levels,
+#         num_layers=3,
+#         kernel_size=3,
+#         act_layer=nn.ReLU,
+#         with_ln=False
+#     ):
+#         super().__init__()
+#         self.fpn_levels = fpn_levels
+#         self.act = act_layer()
+
+#         # build the conv head
+#         self.head = nn.ModuleList()
+#         self.norm = nn.ModuleList()
+#         for idx in range(num_layers-1):
+#             if idx == 0:
+#                 in_dim = input_dim
+#                 out_dim = feat_dim
+#             else:
+#                 in_dim = feat_dim
+#                 out_dim = feat_dim
+#             self.head.append(
+#                 MaskedConv1D(
+#                     in_dim, out_dim, kernel_size,
+#                     stride=1,
+#                     padding=kernel_size//2,
+#                     bias=(not with_ln)
+#                 )
+#             )
+#             if with_ln:
+#                 self.norm.append(LayerNorm(out_dim))
+#             else:
+#                 self.norm.append(nn.Identity())
+
+#         self.scale = nn.ModuleList()
+#         for idx in range(fpn_levels):
+#             self.scale.append(Scale())
+
+#         # segment regression
+#         self.offset_head = MaskedConv1D(
+#                 feat_dim, 2, kernel_size,
+#                 stride=1, padding=kernel_size//2
+#             )
+
+#     def forward(self, fpn_feats, fpn_masks):
+#         assert len(fpn_feats) == len(fpn_masks)
+#         assert len(fpn_feats) == self.fpn_levels
+
+#         # apply the classifier for each pyramid level
+#         out_offsets = tuple()
+#         for l, (cur_feat, cur_mask) in enumerate(zip(fpn_feats, fpn_masks)):
+#             cur_out = cur_feat
+#             for idx in range(len(self.head)):
+#                 cur_out, _ = self.head[idx](cur_out, cur_mask)
+#                 cur_out = self.act(self.norm[idx](cur_out))
+#             cur_offsets, _ = self.offset_head(cur_out, cur_mask)
+#             out_offsets += (F.relu(self.scale[l](cur_offsets)), )
+
+#         # fpn_masks remains the same
+#         return out_offsets
 
 
 @register_meta_arch("LocPointTransformer")
@@ -24,7 +182,7 @@ class PtTransformer(nn.Module):
         scale_factor,          # scale factor between branch layers
         input_dim,             # input feat dim
         max_seq_len,           # max sequence length (used for training)
-        max_buffer_len_factor, # max buffer size (defined a factor of max_seq_len)
+        # max_buffer_len_factor, # max buffer size (defined a factor of max_seq_len)
         n_head,                # number of heads for self-attention in transformer
         n_mha_win_size,        # window size for self attention; -1 to use full seq
         embd_kernel_size,      # kernel size of the embedding network
@@ -33,12 +191,16 @@ class PtTransformer(nn.Module):
         fpn_dim,               # feature dim on FPN
         fpn_with_ln,           # if to apply layer norm at the end of fpn
         fpn_start_level,       # start level of fpn
+        # head_dim,              # feature dim for head
         regression_range,      # regression range on each level of FPN
+        # head_num_layers,       # number of layers in the head (including the classifier)
+        # head_kernel_size,      # kernel size for reg/cls heads
+        # head_with_ln,          # attache layernorm to reg/cls heads
         use_abs_pe,            # if to use abs position encoding
         use_rel_pe,            # if to use rel position encoding
         num_classes,           # number of action classes
-        train_cfg,             # other cfg for training
-        test_cfg               # other cfg for testing
+        # train_cfg,             # other cfg for training
+        # test_cfg               # other cfg for testing
     ):
         super().__init__()
          # re-distribute params to backbone / neck / head
@@ -68,27 +230,27 @@ class PtTransformer(nn.Module):
         self.max_div_factor = max_div_factor
 
         # training time config
-        self.train_center_sample = train_cfg['center_sample']
+        self.train_center_sample = 'redius' #train_cfg['center_sample']
         assert self.train_center_sample in ['radius', 'none']
-        self.train_center_sample_radius = train_cfg['center_sample_radius']
-        self.train_loss_weight = train_cfg['loss_weight']
-        self.train_cls_prior_prob = train_cfg['cls_prior_prob']
-        self.train_dropout = train_cfg['dropout']
-        self.train_droppath = train_cfg['droppath']
-        self.train_label_smoothing = train_cfg['label_smoothing']
+        self.train_center_sample_radius = 1.5 #train_cfg['center_sample_radius']
+        self.train_loss_weight = 1.0 #train_cfg['loss_weight']
+        self.train_cls_prior_prob = 0.01 #train_cfg['cls_prior_prob']
+        self.train_dropout = 0.0 #train_cfg['dropout']
+        self.train_droppath = 0.1 #train_cfg['droppath']
+        self.train_label_smoothing = 0.0 #train_cfg['label_smoothing']
 
         # test time config
-        self.test_pre_nms_thresh = test_cfg['pre_nms_thresh']
-        self.test_pre_nms_topk = test_cfg['pre_nms_topk']
-        self.test_iou_threshold = test_cfg['iou_threshold']
-        self.test_min_score = test_cfg['min_score']
-        self.test_max_seg_num = test_cfg['max_seg_num']
-        self.test_nms_method = test_cfg['nms_method']
+        self.test_pre_nms_thresh = 0.001 #test_cfg['pre_nms_thresh']
+        self.test_pre_nms_topk = 5000 #test_cfg['pre_nms_topk']
+        self.test_iou_threshold = 0.1 #test_cfg['iou_threshold']
+        self.test_min_score = 0.01 #test_cfg['min_score']
+        self.test_max_seg_num = 1000 #test_cfg['max_seg_num']
+        self.test_nms_method = 'soft' #test_cfg['nms_method']
         assert self.test_nms_method in ['soft', 'hard', 'none']
-        self.test_duration_thresh = test_cfg['duration_thresh']
-        self.test_multiclass_nms = test_cfg['multiclass_nms']
-        self.test_nms_sigma = test_cfg['nms_sigma']
-        self.test_voting_thresh = test_cfg['voting_thresh']
+        self.test_duration_thresh = 0.05 #test_cfg['duration_thresh']
+        self.test_multiclass_nms = True #test_cfg['multiclass_nms']
+        self.test_nms_sigma = 0.5 #test_cfg['nms_sigma']
+        self.test_voting_thresh = 0.75 #test_cfg['voting_thresh']
 
         # we will need a better way to dispatch the params to backbones / necks
         # backbone network: conv + transformer
@@ -141,10 +303,36 @@ class PtTransformer(nn.Module):
             }
         )
 
+        # location generator: points
+        # self.point_generator = make_generator(
+        #     'point',
+        #     **{
+        #         'max_seq_len' : max_seq_len * max_buffer_len_factor,
+        #         'fpn_strides' : self.fpn_strides,
+        #         'regression_range' : self.reg_range
+        #     }
+        # )
+
+        # # classfication and regerssion heads
+        # self.cls_head = PtTransformerClsHead(
+        #     fpn_dim, head_dim, self.num_classes,
+        #     kernel_size=head_kernel_size,
+        #     prior_prob=self.train_cls_prior_prob,
+        #     with_ln=head_with_ln,
+        #     num_layers=head_num_layers,
+        #     empty_cls=train_cfg['head_empty_cls']
+        # )
+        # self.reg_head = PtTransformerRegHead(
+        #     fpn_dim, head_dim, len(self.fpn_strides),
+        #     kernel_size=head_kernel_size,
+        #     num_layers=head_num_layers,
+        #     with_ln=head_with_ln
+        # )
+
         # maintain an EMA of #foreground to stabilize the loss normalizer
         # useful for small mini-batch training
-        self.loss_normalizer = train_cfg['init_loss_norm']
-        self.loss_normalizer_momentum = 0.9
+        # self.loss_normalizer = train_cfg['init_loss_norm']
+        # self.loss_normalizer_momentum = 0.9
 
     @property
     def device(self):
@@ -181,7 +369,7 @@ class PtTransformer(nn.Module):
         # # fpn_masks: F list[B, 1, T_i] -> F List[B, T_i]
         # fpn_masks = [x.squeeze(1) for x in fpn_masks]
 
-        # # return loss during training
+        # return loss during training
         # if self.training:
         #     # generate segment/lable List[N x 2] / List[N] with length = B
         #     assert video_list[0]['segments'] is not None, "GT action labels does not exist"
@@ -575,3 +763,49 @@ class PtTransformer(nn.Module):
             )
 
         return processed_results
+
+
+@BACKBONE_REGISTRY.register()
+def build_PtTransformer_backbone(cfg, input_shape):
+    """
+    """
+    model = PtTransformer()
+    return model
+
+
+@BACKBONE_REGISTRY.register()
+def build_PtTransformer_fpn_backbone(cfg, input_shape: ShapeSpec):
+    """
+    """
+    bottom_up = build_PtTransformer_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    out_channels = cfg.MODEL.FPN.OUT_CHANNELS
+    backbone = FPN(
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=out_channels,
+        norm=cfg.MODEL.FPN.NORM,
+        # top_block=LastLevelP6P7_P5(out_channels, out_channels),
+        top_block=LastLevelMaxPool(),
+        fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+    )
+    return backbone
+
+
+@BACKBONE_REGISTRY.register()
+def build_PtTransformer_bifpn_backbone(cfg, input_shape: ShapeSpec):
+    """
+    """
+    bottom_up = build_PtTransformer_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    backbone = BiFPN(
+        cfg=cfg,
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=cfg.MODEL.BIFPN.OUT_CHANNELS,
+        norm=cfg.MODEL.BIFPN.NORM,
+        num_levels=cfg.MODEL.BIFPN.NUM_LEVELS,
+        num_bifpn=cfg.MODEL.BIFPN.NUM_BIFPN,
+        separable_conv=cfg.MODEL.BIFPN.SEPARABLE_CONV,
+    )
+    return backbone

@@ -13,6 +13,9 @@ import torch
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
 
+from ..actionformer.libs.datasets.data_utils import trivial_batch_collator, worker_init_reset_seed
+from ..actionformer.libs.utils.train_utils import fix_random_seed
+
 
 __all__ = ["DiffusionDetDatasetMapper"]
 
@@ -125,3 +128,74 @@ class DiffusionDetDatasetMapper:
             instances = utils.annotations_to_instances(annos, image_shape)
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict
+
+
+datasets = {}
+def register_dataset(name):
+   def decorator(cls):
+       datasets[name] = cls
+       return cls
+   return decorator
+
+def make_dataset(name, is_training, split, **kwargs):
+   """
+       A simple dataset builder
+   """
+   dataset = datasets[name](is_training, split, **kwargs)
+   return dataset
+
+def make_data_loader(dataset, is_training, generator, batch_size, num_workers):
+    """
+        A simple dataloder builder
+    """
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=trivial_batch_collator,
+        worker_init_fn=(worker_init_reset_seed if is_training else None),
+        shuffle=is_training,
+        drop_last=is_training,
+        generator=generator,
+        persistent_workers=True
+    )
+    return loader
+
+size2config = {
+    'dataset': {
+        'json_file': '../data/thumos/annotations/thumos14.json',
+        'feat_folder': '../data/thumos/i3d_features',
+        'file_prefix': '~',
+        'file_ext': '.npy',
+        'num_classes': 20,
+        'input_dim': 2048,
+        'feat_stride': 4,
+        'num_frames': 16,
+        # serve as data augmentation
+        'trunc_thresh': 0.5,
+        'crop_ratio': [0.9, 1.0],
+        'max_seq_len': 2304,
+    },
+    "loader": {
+        "batch_size": 8,
+        "num_workers": 4,
+    },
+    "init_rand_seed":1234567891
+}
+
+def make_train_loader():
+
+    rng_generator = fix_random_seed(size2config['init_rand_seed'], include_cuda=True)
+
+    train_dataset = make_dataset(
+        'thumos', True, ['validation'], **size2config['dataset']
+    )
+    # update cfg based on dataset attributes (fix to epic-kitchens)
+    # train_db_vars = train_dataset.get_attributes()
+    # cfg['model']['train_cfg']['head_empty_cls'] = train_db_vars['empty_label_ids']
+
+    # data loaders
+    train_loader = make_data_loader(
+        train_dataset, True, rng_generator, **size2config['loader'])
+    
+    return train_loader

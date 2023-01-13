@@ -18,16 +18,7 @@ from typing import Any, Dict, List, Set
 import logging
 from collections import OrderedDict
 
-import argparse
-import time
-import datetime
-from pprint import pprint
-
 import torch
-import torch.nn as nn
-import torch.utils.data
-from torch.utils.tensorboard import SummaryWriter
-
 from fvcore.nn.precise_bn import get_bn_modules
 
 import detectron2.utils.comm as comm
@@ -46,19 +37,10 @@ from diffusiondet.util.model_ema import add_model_ema_configs, may_build_model_e
     apply_model_ema_and_restore, EMADetectionCheckpointer
 
 
-# our code
-from actionformer.libs.core import load_config
-from actionformer.libs.datasets import make_dataset, make_data_loader
-from actionformer.libs.modeling import make_meta_arch
-from actionformer.libs.utils import (train_one_epoch, valid_one_epoch, ANETdetection,
-                        save_checkpoint, make_optimizer, make_scheduler,
-                        fix_random_seed, ModelEma)
-
-
 class Trainer(DefaultTrainer):
     """ Extension of the Trainer class adapted to DiffusionDet. """
 
-    def __init__(self, cfg, encoder, train_loader):
+    def __init__(self, cfg):
         """
         Args:
             cfg (CfgNode):
@@ -70,9 +52,9 @@ class Trainer(DefaultTrainer):
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
 
         # Assume these objects must be constructed in this order.
-        model = self.build_model(cfg, encoder)
+        model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
-        data_loader = train_loader()
+        data_loader = self.build_train_loader(cfg)
 
         model = create_ddp_model(model, broadcast_buffers=False)
         self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
@@ -100,7 +82,7 @@ class Trainer(DefaultTrainer):
         self.register_hooks(self.build_hooks())
 
     @classmethod
-    def build_model(cls, cfg, encoder):
+    def build_model(cls, cfg):
         """
         Returns:
             torch.nn.Module:
@@ -108,7 +90,7 @@ class Trainer(DefaultTrainer):
         It now calls :func:`detectron2.modeling.build_model`.
         Overwrite it if you'd like a different model.
         """
-        model = build_model(cfg, encoder)
+        model = build_model(cfg)
         logger = logging.getLogger(__name__)
         logger.info("Model:\n{}".format(model))
         # setup EMA
@@ -130,10 +112,10 @@ class Trainer(DefaultTrainer):
         else:
             return COCOEvaluator(dataset_name, cfg, True, output_folder)
 
-    # @classmethod
-    # def build_train_loader(cls, cfg):
-    #     mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
-    #     return build_detection_train_loader(cfg, mapper=mapper)
+    @classmethod
+    def build_train_loader(cls, cfg):
+        mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
+        return build_detection_train_loader(cfg, mapper=mapper)
 
     @classmethod
     def build_optimizer(cls, cfg, model):
@@ -279,107 +261,31 @@ def setup(args):
 
 
 def main(args):
-    '''actionformer model'''
-    """main function that handles training / inference"""
-
-    """1. setup parameters / folders"""
-    # parse args
-    args.start_epoch = 0
-    if os.path.isfile(args.config):
-        af_cfg = load_config(args.config)
-    else:
-        raise ValueError("Config file does not exist.")
-    # pprint(af_cfg)
-
-    # prep for output folder (based on time stamp)
-    if not os.path.exists(af_cfg['output_folder']):
-        os.mkdir(af_cfg['output_folder'])
-    cfg_filename = os.path.basename(args.config).replace('.yaml', '')
-    if len(args.output) == 0:
-        ts = datetime.datetime.fromtimestamp(int(time.time()))
-        ckpt_folder = os.path.join(
-            af_cfg['output_folder'], cfg_filename + '_' + str(ts))
-    else:
-        ckpt_folder = os.path.join(
-            af_cfg['output_folder'], cfg_filename + '_' + str(args.output))
-    if not os.path.exists(ckpt_folder):
-        os.mkdir(ckpt_folder)
-    # tensorboard writer
-    tb_writer = SummaryWriter(os.path.join(ckpt_folder, 'logs'))
-
-    # fix the random seeds (this will fix everything)
-    rng_generator = fix_random_seed(af_cfg['init_rand_seed'], include_cuda=True)
-
-    # re-scale learning rate / # workers based on number of GPUs
-    af_cfg['opt']["learning_rate"] *= len(af_cfg['devices'])
-    af_cfg['loader']['num_workers'] *= len(af_cfg['devices'])
-
-    """2. create dataset / dataloader"""
-    
-    train_dataset = make_dataset(
-        af_cfg['dataset_name'], True, af_cfg['train_split'], **af_cfg['dataset']
-    )
-    # update cfg based on dataset attributes (fix to epic-kitchens)
-    train_db_vars = train_dataset.get_attributes()
-    af_cfg['model']['train_cfg']['head_empty_cls'] = train_db_vars['empty_label_ids']
-
-    # data loaders
-    train_loader = make_data_loader(
-        train_dataset, True, rng_generator, **af_cfg['loader'])
-
-    """3. create model, optimizer, and scheduler"""
-    
-    # model
-    encoder = make_meta_arch(af_cfg['model_name'], **af_cfg['model'])
-    # not ideal for multi GPU training, ok for now
-    encoder = nn.DataParallel(encoder, device_ids=af_cfg['devices'])
-
-    
-
-
-    # wrap up
-    tb_writer.close()
-    print("All done!")
-
-    '''diffusion model'''
-    diff_cfg = setup(args)
+    cfg = setup(args)
 
     if args.eval_only:
-        model = Trainer.build_model(diff_cfg, encoder)
-        kwargs = may_get_ema_checkpointer(diff_cfg, model)
-        if diff_cfg.MODEL_EMA.ENABLED:
-            EMADetectionCheckpointer(model, save_dir=diff_cfg.OUTPUT_DIR, **kwargs).resume_or_load(diff_cfg.MODEL.WEIGHTS,
+        model = Trainer.build_model(cfg)
+        kwargs = may_get_ema_checkpointer(cfg, model)
+        if cfg.MODEL_EMA.ENABLED:
+            EMADetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR, **kwargs).resume_or_load(cfg.MODEL.WEIGHTS,
                                                                                               resume=args.resume)
         else:
-            DetectionCheckpointer(model, save_dir=diff_cfg.OUTPUT_DIR, **kwargs).resume_or_load(diff_cfg.MODEL.WEIGHTS,
+            DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR, **kwargs).resume_or_load(cfg.MODEL.WEIGHTS,
                                                                                            resume=args.resume)
-        res = Trainer.ema_test(diff_cfg, model)
-        if diff_cfg.TEST.AUG.ENABLED:
-            res.update(Trainer.test_with_TTA(diff_cfg, model))
+        res = Trainer.ema_test(cfg, model)
+        if cfg.TEST.AUG.ENABLED:
+            res.update(Trainer.test_with_TTA(cfg, model))
         if comm.is_main_process():
-            verify_results(diff_cfg, res)
+            verify_results(cfg, res)
         return res
 
-    trainer = Trainer(diff_cfg, encoder, train_loader)
+    trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
     return trainer.train()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-      description='Train a point-based transformer for action localization')
-    parser.add_argument('config', metavar='DIR',
-                        help='path to a config file')
-    parser.add_argument('-p', '--print-freq', default=10, type=int,
-                        help='print frequency (default: 10 iterations)')
-    parser.add_argument('-c', '--ckpt-freq', default=5, type=int,
-                        help='checkpoint frequency (default: every 5 epochs)')
-    parser.add_argument('--output', default='', type=str,
-                        help='name of exp folder (default: none)')
-    parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                        help='path to a checkpoint (default: none)')
-    args = parser.parse_args()
-
+    args = default_argument_parser().parse_args()
     print("Command Line Args:", args)
     launch(
         main,

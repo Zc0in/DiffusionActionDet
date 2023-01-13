@@ -58,7 +58,7 @@ def main(args):
     cfg['loader']['num_workers'] *= len(cfg['devices'])
 
     """2. create dataset / dataloader"""
-    '''TODO: Load annotation'''
+    
     train_dataset = make_dataset(
         cfg['dataset_name'], True, cfg['train_split'], **cfg['dataset']
     )
@@ -71,7 +71,7 @@ def main(args):
         train_dataset, True, rng_generator, **cfg['loader'])
 
     """3. create model, optimizer, and scheduler"""
-    '''TODO: Add diffusion model'''
+    
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
     # not ideal for multi GPU training, ok for now
