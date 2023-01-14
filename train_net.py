@@ -32,7 +32,7 @@ from detectron2.evaluation import COCOEvaluator, LVISEvaluator, verify_results
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.modeling import build_model
 
-from diffusiondet import DiffusionDetDatasetMapper, add_diffusiondet_config, DiffusionDetWithTTA
+from diffusiondet import DiffusionDetDatasetMapper, add_diffusiondet_config, DiffusionDetWithTTA, train_loader
 from diffusiondet.util.model_ema import add_model_ema_configs, may_build_model_ema, may_get_ema_checkpointer, EMAHook, \
     apply_model_ema_and_restore, EMADetectionCheckpointer
 
@@ -114,8 +114,10 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
-        mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
-        return build_detection_train_loader(cfg, mapper=mapper)
+        dataset = train_loader()
+        # mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
+        # return build_detection_train_loader(dataset, cfg, mapper=mapper)
+        return build_detection_train_loader(dataset, cfg)
 
     @classmethod
     def build_optimizer(cls, cfg, model):
